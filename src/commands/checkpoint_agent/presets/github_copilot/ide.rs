@@ -220,15 +220,19 @@ pub(super) fn parse_vscode_native_hooks(
             model: transcript_path
                 .as_ref()
                 .and_then(|tp| {
+                    let path = Path::new(tp.as_str());
                     let sweep_format = match transcript_format {
                         TranscriptFormat::CopilotEventStreamJsonl => {
                             crate::transcripts::sweep::TranscriptFormat::CopilotEventStreamJsonl
                         }
                         _ => crate::transcripts::sweep::TranscriptFormat::CopilotSessionJson,
                     };
-                    model_extraction::extract_model(Path::new(tp.as_str()), sweep_format, None)
+                    model_extraction::extract_model(path, sweep_format, None)
                         .ok()
                         .flatten()
+                        .or_else(|| {
+                            model_extraction::extract_model_from_copilot_editing_state(path)
+                        })
                 })
                 .unwrap_or_else(|| "unknown".to_string()),
         },

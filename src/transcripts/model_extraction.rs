@@ -142,6 +142,87 @@ fn extract_model_from_amp_thread_json(path: &Path) -> Result<Option<String>, Tra
     Ok(model)
 }
 
+/// Extract model from VS Code workspace state.vscdb.
+/// The workspace state db stores the currently selected model in the chat panel,
+/// written when the user selects a model (before the session runs), so it is
+/// available without any race condition at PostToolUse hook time.
+///
+/// The transcript path looks like:
+///   .../workspaceStorage/`<ws>`/GitHub.copilot-chat/transcripts/`<session_id>`.jsonl
+/// The workspace state db is at:
+///   .../workspaceStorage/`<ws>`/state.vscdb
+pub fn extract_model_from_copilot_editing_state(transcript_path: &Path) -> Option<String> {
+    // Navigate up from transcripts/<id>.jsonl -> GitHub.copilot-chat -> workspaceStorage/<ws>
+    let workspace_storage_dir = transcript_path.parent()?.parent()?.parent()?;
+
+    // First: read the model from state.vscdb (no race condition - set before session runs)
+    let state_vscdb = workspace_storage_dir.join("state.vscdb");
+    if let Some(model) = extract_model_from_vscode_state_db(&state_vscdb) {
+        return Some(model);
+    }
+
+    // Fallback: try state.json (may be written after hook fires — race condition)
+    let session_id = transcript_path.file_stem()?.to_str()?;
+    let state_json_path = workspace_storage_dir
+        .join("chatEditingSessions")
+        .join(session_id)
+        .join("state.json");
+
+    let content = std::fs::read_to_string(&state_json_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    json.get("recentSnapshot")?
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            entry
+                .get("telemetryInfo")?
+                .get("modelId")?
+                .as_str()
+                .map(String::from)
+        })
+}
+
+/// Read the selected model from VS Code's workspace state.vscdb.
+/// Tries `memento/interactive-session-view-copilot.selectedModel.identifier` first,
+/// then `chat.untitledInputState.selectedModel.identifier` as fallback.
+fn extract_model_from_vscode_state_db(state_vscdb: &Path) -> Option<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state_vscdb,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+
+    let _ = conn.execute_batch("PRAGMA cache_size = -2000;");
+
+    for key in &[
+        "memento/interactive-session-view-copilot",
+        "chat.untitledInputState",
+    ] {
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(json_str) = row
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str)
+            && let Some(model) = json
+                .get("selectedModel")
+                .and_then(|m| m.get("identifier"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        {
+            return Some(model);
+        }
+    }
+
+    None
+}
+
 fn extract_model_from_opencode_sqlite(
     path: &Path,
     session_id: Option<&str>,
