@@ -2722,13 +2722,14 @@ fn run_diff_tree_with_hunks(
                     // For renames/copies, raw format has "old_path\tnew_path";
                     // use the new (destination) path.
                     let file_path = if matches!(status_char, 'R' | 'C') {
-                        raw_path
-                            .rsplit_once('\t')
-                            .map(|(_, new)| new)
-                            .unwrap_or(raw_path)
-                            .to_string()
+                        crate::utils::unescape_git_path(
+                            raw_path
+                                .rsplit_once('\t')
+                                .map(|(_, new)| new)
+                                .unwrap_or(raw_path),
+                        )
                     } else {
-                        raw_path.to_string()
+                        crate::utils::unescape_git_path(raw_path)
                     };
 
                     if pathspecs_lookup.contains(file_path.as_str()) {
@@ -2753,7 +2754,7 @@ fn run_diff_tree_with_hunks(
         // diff --git a/path b/path
         if line.starts_with("diff --git ") {
             if let Some(b_path) = line.split(" b/").last() {
-                current_diff_file = Some(b_path.to_string());
+                current_diff_file = Some(crate::utils::unescape_git_path(b_path));
             }
             continue;
         }
