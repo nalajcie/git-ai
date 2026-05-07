@@ -1157,10 +1157,9 @@ impl Repository {
     /// Get the canonical (absolute, resolved) path of the working directory
     /// Check if a path is within the repository's working directory.
     ///
-    /// Returns `false` for paths inside nested independent git repos (subdirectories
-    /// with their own `.git/` directory), since those files belong to the nested repo,
-    /// not this one. Submodules (`.git` file, not directory) are transparent and still
-    /// considered part of this repo.
+    /// Returns `false` for paths inside nested independent git repos, linked worktrees,
+    /// or submodules, since those files belong to the nested repository rather than this
+    /// repository's working tree.
     pub fn path_is_in_workdir(&self, path: &Path) -> bool {
         // Try canonical comparison first (most reliable, especially on Windows)
         if let Ok(canonical_path) = path.canonicalize() {
@@ -2404,15 +2403,11 @@ pub fn discover_repository_in_path_no_git_exec(path: &Path) -> Result<Repository
 }
 
 /// Check if any directory between `workdir` and `file_path` contains a `.git`
-/// entry that represents a **separate** git repository boundary.
+/// entry that represents a separate git repository boundary.
 ///
-/// `.git` directories (nested independent repos) and `.git` files that point
-/// to a *linked worktree* (i.e., `gitdir: .../worktrees/…`) are treated as
-/// boundaries — a file inside such a directory belongs to a different repo.
-///
-/// `.git` files that point to a *submodule* (i.e., `gitdir: .git/modules/…`)
-/// are intentionally transparent: the parent repo tracks the submodule's
-/// files, so they should still be considered part of the parent's workdir.
+/// `.git` directories and `.git` files both mark boundaries here. A `.git` file
+/// is how Git represents linked worktrees and submodules; in both cases, files
+/// below that directory belong to the nested repository, not the parent repo.
 fn has_intervening_git_dir(file_path: &Path, workdir: &Path) -> bool {
     let Ok(relative) = file_path.strip_prefix(workdir) else {
         return false;
@@ -2428,41 +2423,12 @@ fn has_intervening_git_dir(file_path: &Path, workdir: &Path) -> bool {
             break;
         }
         let potential_git = workdir.join(parent).join(".git");
-        if potential_git.is_dir() {
-            // A .git directory always indicates a separate independent repo.
+        if potential_git.is_dir() || potential_git.is_file() {
             return true;
-        }
-        if potential_git.is_file() {
-            // A .git file is either a submodule pointer or a linked-worktree
-            // pointer.  Only linked worktrees (gitdir points to …/worktrees/…)
-            // represent a separate working-tree boundary; submodule pointers
-            // (gitdir points to …/modules/…) are transparent to the parent.
-            if is_linked_worktree_git_file(&potential_git) {
-                return true;
-            }
         }
         current = parent;
     }
     false
-}
-
-/// Returns `true` if `git_file` is a `.git` file that points to a linked
-/// worktree (i.e., the `gitdir:` target path contains `/worktrees/`).
-fn is_linked_worktree_git_file(git_file: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(git_file) else {
-        return false;
-    };
-    // Format: "gitdir: <path>\n"
-    let Some(gitdir) = contents
-        .lines()
-        .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
-    else {
-        return false;
-    };
-    // A linked worktree's gitdir resolves to something like
-    // `/repo/.git/worktrees/<name>`.  A submodule's gitdir looks like
-    // `../.git/modules/<name>`.
-    gitdir.contains("/.git/worktrees/")
 }
 
 pub fn find_repository_in_path(path: &str) -> Result<Repository, GitAiError> {
@@ -2525,20 +2491,6 @@ pub fn find_repository_for_file(
         // Check for .git directory or file (file for submodules/worktrees)
         let git_path = dir.join(".git");
         if git_path.exists() {
-            // Found a .git - but we need to check if this is a submodule
-            // Submodules have a .git file (not directory) that points to the parent's .git/modules
-            if git_path.is_file() {
-                // This is a submodule - read the file to check if it points to modules/
-                if let Ok(content) = std::fs::read_to_string(&git_path)
-                    && content.contains("gitdir:")
-                    && content.contains("/modules/")
-                {
-                    // This is a submodule, skip it and continue searching up
-                    current_dir = dir.parent();
-                    continue;
-                }
-            }
-
             // Found a real git repository, use find_repository_in_path
             return find_repository_in_path(&dir.to_string_lossy());
         }

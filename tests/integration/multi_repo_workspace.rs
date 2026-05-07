@@ -5,7 +5,7 @@
 //!
 //! 1. Detecting git repository from file paths when workspace root isn't a git repo
 //! 2. Grouping files by their containing repository
-//! 3. Handling submodules correctly (should be ignored in favor of parent repo)
+//! 3. Handling submodules correctly (files should resolve to the submodule repo)
 //! 4. Edge cases with nested git directories
 //! 5. Cross-repo checkpoints: AI edits from one repo to files in another repo
 
@@ -16,7 +16,7 @@ use git_ai::git::repository::{
     find_repository_for_file, find_repository_in_path, group_files_by_repository,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -92,6 +92,10 @@ fn create_file(path: &PathBuf, content: &str) -> Result<(), GitAiError> {
 /// Clean up a temporary directory
 fn cleanup_tmp_dir(path: &PathBuf) {
     let _ = fs::remove_dir_all(path);
+}
+
+fn canonicalize_for_assert(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[test]
@@ -585,6 +589,94 @@ fn test_find_repository_for_file_nested_repos() {
         inner_workdir.to_string_lossy().contains("inner"),
         "Inner file should be in inner repo, got: {}",
         inner_workdir.display()
+    );
+
+    cleanup_tmp_dir(&workspace);
+}
+
+#[test]
+fn test_find_repository_for_file_submodule_resolves_to_submodule() {
+    let workspace = create_unique_tmp_dir("git-ai-submodule-repo-test").unwrap();
+
+    let superrepo = workspace.join("superrepo");
+    init_git_repo(&superrepo).unwrap();
+
+    let submodule = superrepo.join("vendor").join("library");
+    init_git_repo(&submodule).unwrap();
+    let modules_git_dir = superrepo
+        .join(".git")
+        .join("modules")
+        .join("vendor")
+        .join("library");
+    fs::create_dir_all(modules_git_dir.parent().unwrap()).unwrap();
+    fs::rename(submodule.join(".git"), &modules_git_dir).unwrap();
+    fs::write(
+        submodule.join(".git"),
+        "gitdir: ../../.git/modules/vendor/library\n",
+    )
+    .unwrap();
+
+    let submodule_file = submodule.join("src").join("lib.rs");
+    create_file(&submodule_file, "pub fn library() {}\n").unwrap();
+
+    let result = find_repository_for_file(
+        submodule_file.to_str().unwrap(),
+        Some(workspace.to_str().unwrap()),
+    )
+    .expect("submodule file should resolve to a repository");
+
+    let workdir = result.workdir().unwrap();
+    let actual_workdir = canonicalize_for_assert(&workdir);
+    let expected_workdir = canonicalize_for_assert(&submodule);
+    assert_eq!(
+        actual_workdir,
+        expected_workdir,
+        "submodule file should resolve to the submodule workdir, got {}",
+        workdir.display()
+    );
+
+    cleanup_tmp_dir(&workspace);
+}
+
+#[test]
+fn test_group_files_by_repository_splits_superrepo_and_submodules() {
+    let workspace = create_unique_tmp_dir("git-ai-submodule-group-test").unwrap();
+
+    let superrepo = workspace.join("superrepo");
+    init_git_repo(&superrepo).unwrap();
+    let super_file = superrepo.join("README.md");
+    create_file(&super_file, "# Superrepo\n").unwrap();
+
+    let mut file_paths = vec![super_file.to_string_lossy().to_string()];
+    for name in ["alpha", "beta"] {
+        let submodule = superrepo.join("modules").join(name);
+        init_git_repo(&submodule).unwrap();
+        let modules_git_dir = superrepo
+            .join(".git")
+            .join("modules")
+            .join("modules")
+            .join(name);
+        fs::create_dir_all(modules_git_dir.parent().unwrap()).unwrap();
+        fs::rename(submodule.join(".git"), &modules_git_dir).unwrap();
+        fs::write(
+            submodule.join(".git"),
+            format!("gitdir: ../../.git/modules/modules/{}\n", name),
+        )
+        .unwrap();
+
+        let file = submodule.join("src").join("lib.rs");
+        create_file(&file, "pub fn module() {}\n").unwrap();
+        file_paths.push(file.to_string_lossy().to_string());
+    }
+
+    let (repo_files, orphan_files) =
+        group_files_by_repository(&file_paths, Some(workspace.to_str().unwrap()));
+
+    assert!(orphan_files.is_empty(), "No orphan files");
+    assert_eq!(
+        repo_files.len(),
+        3,
+        "superrepo and two submodules should be grouped as separate repositories"
     );
 
     cleanup_tmp_dir(&workspace);
