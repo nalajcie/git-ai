@@ -613,7 +613,7 @@ fn checkpoint_routes_to_linked_worktree_when_cwd_is_main_repo() {
 ///
 /// This is the exact structure that caused Bug-A / Bug-B: `path_is_in_workdir` returned
 /// `true` because the file's path starts with the main repo's workdir, and only the
-/// `.git` FILE detection (is_linked_worktree_git_file) distinguishes it from a regular
+/// `.git` FILE boundary detection distinguishes it from a regular
 /// subdirectory.  Without the fix this test fails silently — the checkpoint is skipped
 /// and `checkpoints.jsonl` remains empty.
 #[test]
@@ -773,7 +773,7 @@ fn human_checkpoint_routes_to_linked_worktree_when_cwd_is_main_repo() {
 
 /// Same as `human_checkpoint_routes_to_linked_worktree_when_cwd_is_main_repo` but
 /// the worktree lives *inside* the main repo's working tree.  Without the
-/// is_linked_worktree_git_file fix, path_is_in_workdir returns true, the Human
+/// .git file boundary fix, path_is_in_workdir returns true, the Human
 /// checkpoint is processed against the wrong repo, and this test fails.
 #[test]
 fn human_checkpoint_routes_to_nested_linked_worktree_when_cwd_is_main_repo() {

@@ -390,7 +390,7 @@ fn path_is_in_workdir_returns_false_for_linked_worktree_file() {
     // Sibling worktree: the worktree lives OUTSIDE the main repo's working tree.
     // path_is_in_workdir returns false purely because the path doesn't
     // start_with(workdir) — no .git file inspection is needed.  This test
-    // passes even without the is_linked_worktree_git_file fix.
+    // passes even without inspecting nested .git files.
     let temp = tempfile::tempdir().expect("tempdir");
     let main_repo = temp.path().join("main");
     let worktree = temp.path().join("linked");
@@ -433,7 +433,7 @@ fn path_is_in_workdir_returns_false_for_nested_linked_worktree_file() {
     // Nested worktree: the worktree lives INSIDE the main repo's working tree
     // (e.g. main_repo/.worktrees/feature).  This is the exact Bug-A / Bug-B
     // scenario: path starts_with(workdir) so the starts_with check passes,
-    // and only is_linked_worktree_git_file makes path_is_in_workdir return
+    // and only .git file boundary detection makes path_is_in_workdir return
     // false.  This test FAILS without the fix.
     let temp = tempfile::tempdir().expect("tempdir");
     let main_repo = temp.path().join("main");

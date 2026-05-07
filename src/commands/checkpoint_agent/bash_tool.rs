@@ -15,7 +15,7 @@ use crate::utils::normalize_to_posix;
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -499,6 +499,170 @@ pub fn should_include_new_file(gitignore: &Gitignore, path: &Path, is_dir: bool)
     !matched.is_ignore()
 }
 
+fn configured_submodule_paths(repo_root: &Path) -> Vec<PathBuf> {
+    let gitmodules = repo_root.join(".gitmodules");
+    if !gitmodules.is_file() {
+        return Vec::new();
+    }
+
+    let Ok(config) = gix_config::File::from_path_no_includes(gitmodules, gix_config::Source::Local)
+    else {
+        return Vec::new();
+    };
+
+    let Some(sections) = config.sections_by_name("submodule") else {
+        return Vec::new();
+    };
+
+    sections
+        .filter_map(|section| section.value("path"))
+        .map(|value| String::from_utf8_lossy(value.as_ref()).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn collect_submodule_roots(repo_root: &Path) -> Vec<PathBuf> {
+    fn collect(repo_root: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+        for relative_path in configured_submodule_paths(repo_root) {
+            let submodule_root = repo_root.join(relative_path);
+            if !submodule_root.is_dir() || !submodule_root.join(".git").exists() {
+                continue;
+            }
+            let key = submodule_root
+                .canonicalize()
+                .unwrap_or_else(|_| submodule_root.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(submodule_root.clone());
+            collect(&submodule_root, seen, out);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    collect(repo_root, &mut seen, &mut out);
+    out
+}
+
+struct SnapshotWalkOptions<'a> {
+    scan_root: &'a Path,
+    key_root: &'a Path,
+    ignore_root: &'a Path,
+    start: Instant,
+    effective_worktree_wm: Option<u128>,
+    per_file_wm: &'a HashMap<String, u128>,
+}
+
+fn collect_snapshot_entries(
+    options: SnapshotWalkOptions<'_>,
+    entries: &mut HashMap<PathBuf, StatEntry>,
+) -> Result<(), GitAiError> {
+    let gitignore_filter = Arc::new(build_gitignore(options.ignore_root)?);
+    let ignore_root_buf = options.ignore_root.to_path_buf();
+    let walker = WalkBuilder::new(options.scan_root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |entry| {
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            let abs = entry.path();
+            let Ok(rel) = abs.strip_prefix(&ignore_root_buf) else {
+                return true;
+            };
+            if rel.as_os_str().is_empty() {
+                return true;
+            }
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            should_include_new_file(&gitignore_filter, rel, is_dir)
+        })
+        .build();
+
+    let walk_timeout = Duration::from_millis(effective_walk_timeout_ms());
+    for result in walker {
+        let elapsed = options.start.elapsed();
+        if elapsed >= walk_timeout {
+            let elapsed_ms = elapsed.as_millis();
+            let timeout_ms = walk_timeout.as_millis();
+            let msg = format!(
+                "bash_tool: snapshot walk exceeded {}ms limit ({}ms elapsed, {} entries so far); abandoning stat-diff",
+                timeout_ms,
+                elapsed_ms,
+                entries.len()
+            );
+            tracing::debug!("{}", msg);
+            crate::observability::log_message(
+                &msg,
+                "warning",
+                Some(serde_json::json!({
+                    "elapsed_ms": elapsed_ms,
+                    "entries_so_far": entries.len(),
+                    "walk_timeout_ms": timeout_ms,
+                })),
+            );
+            return Err(GitAiError::Generic(msg));
+        }
+
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!("Walker error: {}", e);
+                continue;
+            }
+        };
+
+        let abs_path = entry.path();
+        if entry
+            .file_type()
+            .map(|ft| ft.is_dir())
+            .unwrap_or_else(|| abs_path.is_dir())
+        {
+            continue;
+        }
+
+        let rel_path = match abs_path.strip_prefix(options.key_root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let normalized = normalize_path(rel_path);
+
+        match fs::symlink_metadata(abs_path) {
+            Ok(meta) => {
+                let stat = StatEntry::from_metadata(&meta);
+                let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
+                let posix_key = normalize_to_posix(&normalized.to_string_lossy());
+                if !is_wm_covered(
+                    mtime_ns,
+                    options.effective_worktree_wm,
+                    options.per_file_wm,
+                    &posix_key,
+                ) {
+                    entries.insert(normalized, stat);
+                    if entries.len() > MAX_TRACKED_FILES {
+                        tracing::debug!(
+                            "Snapshot: exceeded MAX_TRACKED_FILES ({}), skipping stat-diff",
+                            MAX_TRACKED_FILES
+                        );
+                        return Err(GitAiError::Generic(format!(
+                            "repo has more than {} recently-modified files; skipping stat-diff",
+                            MAX_TRACKED_FILES
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to stat {}: {}", abs_path.display(), e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot
 // ---------------------------------------------------------------------------
@@ -541,120 +705,32 @@ pub fn snapshot(
 
     let per_file_wm: HashMap<String, u128> = wm.map(|w| w.per_file.clone()).unwrap_or_default();
 
-    // Build the git-ai ignore ruleset: gitignore + defaults + .git-ai-ignore + linguist.
-    // Arc is needed because filter_entry requires 'static, preventing a borrow.
-    // The closure takes sole ownership; no post-walker use of the ruleset is needed.
-    let gitignore_filter = Arc::new(build_gitignore(repo_root)?);
-
     let mut entries = HashMap::new();
 
-    // Pass the git-ai ignore ruleset directly into the walker via filter_entry.
-    // This prunes entire ignored directories (node_modules/, target/, etc.)
-    // before the walker descends into them — including directories that are in
-    // default_ignore_patterns() but not yet in the repo's .gitignore (a common
-    // case for node_modules that the user hasn't gitignored yet).
-    // git_ignore(true) handles the standard .gitignore case; filter_entry
-    // catches the rest (defaults, .git-ai-ignore, linguist-generated).
-    let repo_root_buf = repo_root.to_path_buf();
-    let walker = WalkBuilder::new(repo_root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(move |entry| {
-            if entry.file_name() == ".git" {
-                return false;
-            }
-            let abs = entry.path();
-            let Ok(rel) = abs.strip_prefix(&repo_root_buf) else {
-                return true; // outside repo root — let walker handle it
-            };
-            if rel.as_os_str().is_empty() {
-                return true; // repo root itself — always include
-            }
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            should_include_new_file(&gitignore_filter, rel, is_dir)
-        })
-        .build();
+    collect_snapshot_entries(
+        SnapshotWalkOptions {
+            scan_root: repo_root,
+            key_root: repo_root,
+            ignore_root: repo_root,
+            start,
+            effective_worktree_wm,
+            per_file_wm: &per_file_wm,
+        },
+        &mut entries,
+    )?;
 
-    let walk_timeout = Duration::from_millis(effective_walk_timeout_ms());
-    for result in walker {
-        let elapsed = start.elapsed();
-        if elapsed >= walk_timeout {
-            let elapsed_ms = elapsed.as_millis();
-            let timeout_ms = walk_timeout.as_millis();
-            let msg = format!(
-                "bash_tool: snapshot walk exceeded {}ms limit ({}ms elapsed, {} entries so far); abandoning stat-diff",
-                timeout_ms,
-                elapsed_ms,
-                entries.len()
-            );
-            tracing::debug!("{}", msg);
-            crate::observability::log_message(
-                &msg,
-                "warning",
-                Some(serde_json::json!({
-                    "elapsed_ms": elapsed_ms,
-                    "entries_so_far": entries.len(),
-                    "walk_timeout_ms": timeout_ms,
-                })),
-            );
-            return Err(GitAiError::Generic(msg));
-        }
-
-        let entry = match result {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::debug!("Walker error: {}", e);
-                continue;
-            }
-        };
-
-        let abs_path = entry.path();
-
-        // Skip directories — filter_entry already pruned ignored dirs; this
-        // guard drops any remaining directory entries (e.g. the repo root).
-        if entry
-            .file_type()
-            .map(|ft| ft.is_dir())
-            .unwrap_or_else(|| abs_path.is_dir())
-        {
-            continue;
-        }
-
-        let rel_path = match abs_path.strip_prefix(repo_root) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // filter_entry already applied should_include_new_file for files too,
-        // so no secondary check is needed here.
-
-        let normalized = normalize_path(rel_path);
-
-        match fs::symlink_metadata(abs_path) {
-            Ok(meta) => {
-                let stat = StatEntry::from_metadata(&meta);
-                let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
-                let posix_key = normalize_to_posix(&normalized.to_string_lossy());
-                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
-                    entries.insert(normalized, stat);
-                    if entries.len() > MAX_TRACKED_FILES {
-                        tracing::debug!(
-                            "Snapshot: exceeded MAX_TRACKED_FILES ({}), skipping stat-diff",
-                            MAX_TRACKED_FILES
-                        );
-                        return Err(GitAiError::Generic(format!(
-                            "repo has more than {} recently-modified files; skipping stat-diff",
-                            MAX_TRACKED_FILES
-                        )));
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!("Failed to stat {}: {}", abs_path.display(), e);
-            }
-        }
+    for submodule_root in collect_submodule_roots(repo_root) {
+        collect_snapshot_entries(
+            SnapshotWalkOptions {
+                scan_root: &submodule_root,
+                key_root: repo_root,
+                ignore_root: &submodule_root,
+                start,
+                effective_worktree_wm,
+                per_file_wm: &per_file_wm,
+            },
+            &mut entries,
+        )?;
     }
 
     tracing::debug!(
@@ -721,63 +797,89 @@ pub fn diff(pre: &StatSnapshot, post: &StatSnapshot) -> StatDiffResult {
 /// Fall back to `git status --porcelain=v2` to detect changed files.
 /// Used when the pre-snapshot is lost (process restart) or on very large repos.
 pub fn git_status_fallback(repo_root: &Path) -> Result<Vec<String>, GitAiError> {
-    let args = vec![
-        "-C".to_string(),
-        repo_root.to_string_lossy().into_owned(),
-        "status".to_string(),
-        "--porcelain=v2".to_string(),
-        "-z".to_string(),
-        "--untracked-files=all".to_string(),
-    ];
-    let output = crate::git::repository::exec_git_allow_nonzero(&args)?;
+    fn collect_status(
+        repo_root: &Path,
+        current_root: &Path,
+        changed_files: &mut Vec<String>,
+    ) -> Result<(), GitAiError> {
+        let args = vec![
+            "-C".to_string(),
+            current_root.to_string_lossy().into_owned(),
+            "status".to_string(),
+            "--porcelain=v2".to_string(),
+            "-z".to_string(),
+            "--untracked-files=all".to_string(),
+        ];
+        let output = crate::git::repository::exec_git_allow_nonzero(&args)?;
 
-    if !output.status.success() {
-        return Err(GitAiError::Generic(format!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        if !output.status.success() {
+            return Err(GitAiError::Generic(format!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let parts: Vec<&[u8]> = output.stdout.split(|&b| b == 0).collect();
+        let mut i = 0;
+        while i < parts.len() {
+            let part = parts[i];
+            if part.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            let line = String::from_utf8_lossy(part);
+
+            if line.starts_with("1 ") || line.starts_with("u ") {
+                // Ordinary entry: 8 fields before path; unmerged: 10 fields before path
+                let n = if line.starts_with("u ") { 11 } else { 9 };
+                let fields: Vec<&str> = line.splitn(n, ' ').collect();
+                if let Some(path) = fields.last() {
+                    changed_files.push(status_path_from_repo_root(repo_root, current_root, path));
+                }
+            } else if line.starts_with("2 ") {
+                // Rename/copy: 9 fields before new path, then NUL-delimited original path
+                let fields: Vec<&str> = line.splitn(10, ' ').collect();
+                if let Some(path) = fields.last() {
+                    changed_files.push(status_path_from_repo_root(repo_root, current_root, path));
+                }
+                // Also include the original path (next NUL-delimited entry)
+                if i + 1 < parts.len() {
+                    let orig = String::from_utf8_lossy(parts[i + 1]);
+                    if !orig.is_empty() {
+                        changed_files.push(status_path_from_repo_root(
+                            repo_root,
+                            current_root,
+                            &orig,
+                        ));
+                    }
+                }
+                i += 1;
+            } else if let Some(path) = line.strip_prefix("? ") {
+                // Untracked: path follows "? "
+                changed_files.push(status_path_from_repo_root(repo_root, current_root, path));
+            }
+
+            i += 1;
+        }
+
+        for submodule_root in collect_submodule_roots(current_root) {
+            collect_status(repo_root, &submodule_root, changed_files)?;
+        }
+
+        Ok(())
+    }
+
+    fn status_path_from_repo_root(repo_root: &Path, current_root: &Path, path: &str) -> String {
+        let absolute = current_root.join(path);
+        absolute
+            .strip_prefix(repo_root)
+            .map(|relative| normalize_to_posix(&relative.to_string_lossy()))
+            .unwrap_or_else(|_| normalize_to_posix(path))
     }
 
     let mut changed_files = Vec::new();
-    let parts: Vec<&[u8]> = output.stdout.split(|&b| b == 0).collect();
-    let mut i = 0;
-    while i < parts.len() {
-        let part = parts[i];
-        if part.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        let line = String::from_utf8_lossy(part);
-
-        if line.starts_with("1 ") || line.starts_with("u ") {
-            // Ordinary entry: 8 fields before path; unmerged: 10 fields before path
-            let n = if line.starts_with("u ") { 11 } else { 9 };
-            let fields: Vec<&str> = line.splitn(n, ' ').collect();
-            if let Some(path) = fields.last() {
-                changed_files.push(normalize_to_posix(path));
-            }
-        } else if line.starts_with("2 ") {
-            // Rename/copy: 9 fields before new path, then NUL-delimited original path
-            let fields: Vec<&str> = line.splitn(10, ' ').collect();
-            if let Some(path) = fields.last() {
-                changed_files.push(normalize_to_posix(path));
-            }
-            // Also include the original path (next NUL-delimited entry)
-            if i + 1 < parts.len() {
-                let orig = String::from_utf8_lossy(parts[i + 1]);
-                if !orig.is_empty() {
-                    changed_files.push(normalize_to_posix(&orig));
-                }
-            }
-            i += 1;
-        } else if let Some(path) = line.strip_prefix("? ") {
-            // Untracked: path follows "? "
-            changed_files.push(normalize_to_posix(path));
-        }
-
-        i += 1;
-    }
+    collect_status(repo_root, repo_root, &mut changed_files)?;
 
     Ok(changed_files)
 }
