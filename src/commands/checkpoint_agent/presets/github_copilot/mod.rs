@@ -163,6 +163,12 @@ pub(super) fn collect_tool_paths(value: &serde_json::Value, out: &mut Vec<String
                 out.push(s.to_string());
             }
             ide::collect_apply_patch_paths_from_text(s, out);
+            // Try parsing JSON-encoded strings (e.g. tool_input for replace_string_in_file)
+            if (s.starts_with('{') || s.starts_with('['))
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+            {
+                collect_tool_paths(&parsed, out);
+            }
         }
         _ => {}
     }

@@ -220,15 +220,19 @@ pub(super) fn parse_vscode_native_hooks(
             model: transcript_path
                 .as_ref()
                 .and_then(|tp| {
+                    let path = Path::new(tp.as_str());
                     let sweep_format = match transcript_format {
                         TranscriptFormat::CopilotEventStreamJsonl => {
                             crate::transcripts::sweep::TranscriptFormat::CopilotEventStreamJsonl
                         }
                         _ => crate::transcripts::sweep::TranscriptFormat::CopilotSessionJson,
                     };
-                    model_extraction::extract_model(Path::new(tp.as_str()), sweep_format, None)
+                    model_extraction::extract_model(path, sweep_format, None)
                         .ok()
                         .flatten()
+                        .or_else(|| {
+                            model_extraction::extract_model_from_copilot_editing_state(path)
+                        })
                 })
                 .unwrap_or_else(|| "unknown".to_string()),
         },
@@ -302,6 +306,11 @@ pub(super) fn parse_vscode_native_hooks(
             tool_name
         )));
     }
+
+    // For PostToolUse edit tools: the file may not yet be saved to disk by VS Code.
+    // Compute the expected "after" content from tool_input so the checkpoint records
+    // AI attribution even when the filesystem write is delayed.
+    let dirty_files = compute_post_tool_dirty_files(tool_name, tool_input, cwd, dirty_files);
 
     Ok(vec![ParsedHookEvent::PostFileEdit(PostFileEdit {
         context,
@@ -427,6 +436,264 @@ pub(super) fn collect_apply_patch_paths_from_text(raw: &str, out: &mut Vec<Strin
                 out.push(path.to_string());
             }
         }
+    }
+}
+
+/// Compute dirty_files for PostToolUse events by applying the tool's transformation.
+/// VS Code may not have saved the file to disk yet when PostToolUse fires, so we compute
+/// the expected content from tool_input to ensure the checkpoint has the correct "after" state.
+fn compute_post_tool_dirty_files(
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    cwd: &str,
+    existing_dirty_files: Option<HashMap<PathBuf, String>>,
+) -> Option<HashMap<PathBuf, String>> {
+    let lower = tool_name.to_ascii_lowercase();
+
+    // tool_input may be a JSON string that needs parsing, or already a JSON object.
+    let parsed_input: Option<serde_json::Value>;
+    let input_obj = match tool_input {
+        Some(serde_json::Value::Object(_)) => tool_input,
+        Some(serde_json::Value::String(s)) => {
+            // For apply_patch, the string is the patch text itself (not JSON)
+            if lower == "apply_patch" {
+                tool_input
+            } else {
+                // Try parsing as JSON object
+                parsed_input = serde_json::from_str(s).ok();
+                parsed_input.as_ref()
+            }
+        }
+        _ => tool_input,
+    };
+
+    match lower.as_str() {
+        "apply_patch" => {
+            let patch_text = tool_input
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    tool_input
+                        .and_then(|v| v.get("input"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("");
+            if !patch_text.is_empty() {
+                apply_patch_to_dirty_files(patch_text, cwd).or(existing_dirty_files)
+            } else {
+                existing_dirty_files
+            }
+        }
+        "replace_string_in_file" => {
+            let input = input_obj?;
+            let file_path = input
+                .get("filePath")
+                .or_else(|| input.get("file_path"))
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())?;
+            let old_string = input
+                .get("oldString")
+                .or_else(|| input.get("old_string"))
+                .and_then(|v| v.as_str())?;
+            let new_string = input
+                .get("newString")
+                .or_else(|| input.get("new_string"))
+                .and_then(|v| v.as_str())?;
+
+            let path = super::normalize_hook_path(file_path, cwd)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(file_path));
+            let original = std::fs::read_to_string(&path).ok()?;
+            let replaced = original.replacen(old_string, new_string, 1);
+            if replaced == original {
+                return existing_dirty_files;
+            }
+            let mut result = HashMap::new();
+            result.insert(path, replaced);
+            Some(result)
+        }
+        "create_file" => {
+            let input = input_obj?;
+            let file_path = input
+                .get("filePath")
+                .or_else(|| input.get("file_path"))
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())?;
+            let content = input
+                .get("content")
+                .or_else(|| input.get("file_text"))
+                .or_else(|| input.get("fileText"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let path = super::normalize_hook_path(file_path, cwd)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(file_path));
+            let mut result = HashMap::new();
+            result.insert(path, content.to_string());
+            Some(result)
+        }
+        _ => existing_dirty_files,
+    }
+}
+
+/// Apply a VS Code apply_patch tool_input to produce dirty_files with expected content.
+/// Returns None if the patch cannot be applied (malformed patch or file read error).
+fn apply_patch_to_dirty_files(patch_text: &str, cwd: &str) -> Option<HashMap<PathBuf, String>> {
+    let mut result = HashMap::new();
+    let lines: Vec<&str> = patch_text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        if let Some(path_str) = trimmed.strip_prefix("*** Add File: ") {
+            let path_str = path_str.trim();
+            let path = super::normalize_hook_path(path_str, cwd)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(path_str));
+            i += 1;
+            // Collect all added content after the @@ marker
+            let mut content = String::new();
+            if i < lines.len() && lines[i].trim() == "@@" {
+                i += 1;
+            }
+            while i < lines.len() {
+                let line = lines[i];
+                let line_trimmed = line.trim();
+                if line_trimmed.starts_with("*** ") {
+                    break;
+                }
+                if let Some(added) = line.strip_prefix('+') {
+                    content.push_str(added);
+                    content.push('\n');
+                } else if !line.starts_with('-') {
+                    // Context line or bare line in an Add File section
+                    let ctx = line.strip_prefix(' ').unwrap_or(line);
+                    content.push_str(ctx);
+                    content.push('\n');
+                }
+                i += 1;
+            }
+            result.insert(path, content);
+            continue;
+        }
+
+        if let Some(path_str) = trimmed.strip_prefix("*** Update File: ") {
+            let path_str = path_str.trim();
+            let path = super::normalize_hook_path(path_str, cwd)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(path_str));
+            i += 1;
+
+            // Read current file content from disk
+            let original = std::fs::read_to_string(&path).unwrap_or_default();
+            let original_lines: Vec<&str> = original.lines().collect();
+
+            // Parse and apply all hunks for this file
+            let mut output_lines: Vec<String> = Vec::new();
+            let mut src_idx: usize = 0;
+
+            while i < lines.len() {
+                let line_trimmed = lines[i].trim();
+                if line_trimmed.starts_with("*** ") {
+                    break;
+                }
+                if line_trimmed == "@@" {
+                    i += 1;
+                    // Find the context start to locate position in source
+                    let _hunk_start = i;
+                    // Collect hunk lines until next @@ or *** or end
+                    let mut hunk_lines: Vec<&str> = Vec::new();
+                    while i < lines.len() {
+                        let hl = lines[i].trim();
+                        if hl == "@@" || hl.starts_with("*** ") {
+                            break;
+                        }
+                        hunk_lines.push(lines[i]);
+                        i += 1;
+                    }
+
+                    // Find the first context or removal line to locate position
+                    let first_match_line = hunk_lines.iter().find_map(|l| {
+                        if let Some(stripped) = l.strip_prefix(' ').or_else(|| l.strip_prefix('-'))
+                        {
+                            Some(stripped)
+                        } else if !l.starts_with('+') && !l.is_empty() {
+                            Some(*l)
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some(match_content) = first_match_line {
+                        // Find this line in source starting from src_idx
+                        let match_pos = original_lines[src_idx..]
+                            .iter()
+                            .position(|l| *l == match_content)
+                            .map(|p| p + src_idx);
+
+                        if let Some(pos) = match_pos {
+                            // Copy lines before the hunk
+                            for line in &original_lines[src_idx..pos] {
+                                output_lines.push(line.to_string());
+                            }
+                            src_idx = pos;
+                        }
+                    }
+
+                    // Apply the hunk
+                    for hl in &hunk_lines {
+                        if let Some(rest) = hl.strip_prefix('+') {
+                            output_lines.push(rest.to_string());
+                        } else if hl.starts_with('-') {
+                            // Skip this source line
+                            src_idx += 1;
+                        } else if let Some(rest) = hl.strip_prefix(' ') {
+                            output_lines.push(rest.to_string());
+                            src_idx += 1;
+                        } else if !hl.is_empty() {
+                            // Bare context line (no prefix)
+                            output_lines.push(hl.to_string());
+                            src_idx += 1;
+                        }
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+
+            // Copy remaining lines from source
+            while src_idx < original_lines.len() {
+                output_lines.push(original_lines[src_idx].to_string());
+                src_idx += 1;
+            }
+
+            // Join with newlines, preserving trailing newline if original had one
+            let mut content = output_lines.join("\n");
+            if original.ends_with('\n') || content.is_empty() {
+                content.push('\n');
+            }
+            result.insert(path, content);
+            continue;
+        }
+
+        if let Some(path_str) = trimmed.strip_prefix("*** Delete File: ") {
+            let path_str = path_str.trim();
+            let path = super::normalize_hook_path(path_str, cwd)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(path_str));
+            result.insert(path, String::new());
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
     }
 }
 
